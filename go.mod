@@ -4,6 +4,7 @@ go 1.21.6
 
 require (
 	github.com/dgraph-io/badger/v3 v3.2103.5
+	github.com/klauspost/compress v1.17.9
 	github.com/shirou/gopsutil v3.21.11+incompatible
 )
 
@@ -18,9 +19,7 @@ require (
 	github.com/golang/groupcache v0.0.0-20210331224755-41bb18bfe9da // indirect
 	github.com/golang/protobuf v1.5.4 // indirect
 	github.com/golang/snappy v0.0.4 // indirect
-	github.com/google/btree v1.1.2 // indirect
 	github.com/google/flatbuffers v24.3.25+incompatible // indirect
-	github.com/klauspost/compress v1.17.9 // indirect
 	github.com/pkg/errors v0.9.1 // indirect
 	github.com/tklauser/go-sysconf v0.3.14 // indirect
 	github.com/tklauser/numcpus v0.8.0 // indirect
