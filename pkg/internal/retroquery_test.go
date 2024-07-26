@@ -1,6 +1,7 @@
 package tests
 
 import (
+	"fmt"
 	"os"
 	"reflect"
 	"testing"
@@ -13,6 +14,8 @@ func TestRetroQuery(t *testing.T) {
 	configs := []retroquery.Config{
 		{InMemory: true},
 		{InMemory: false, DataDir: "test_data"},
+		{InMemory: true, Compress: true},
+		{InMemory: false, DataDir: "test_data_compressed", Compress: true},
 	}
 
 	for _, config := range configs {
@@ -28,85 +31,214 @@ func TestRetroQuery(t *testing.T) {
 				}
 			}()
 
-			// Test Insert
-			initialTime := time.Now()
-			err = rq.Insert("user:1", map[string]interface{}{"name": "Alice", "age": 30})
-			if err != nil {
-				t.Fatalf("Failed to insert data: %v", err)
-			}
+			t.Run("BasicOperations", func(t *testing.T) {
+				testBasicOperations(t, rq)
+			})
 
-			// Test QueryAtTime (current)
-			data, exists, err := rq.QueryAtTime("user:1", time.Now())
-			if err != nil {
-				t.Fatalf("Failed to query data: %v", err)
-			}
-			if !exists {
-				t.Fatal("Data should exist after insertion")
-			}
-			expectedData := map[string]interface{}{"name": "Alice", "age": 30}
-			if !compareMapsVerbose(t, data, expectedData) {
-				t.Fatalf("Unexpected data: got %v, want %v", data, expectedData)
-			}
+			t.Run("QueryRange", func(t *testing.T) {
+				testQueryRange(t, rq)
+			})
 
-			// Test Update
-			time.Sleep(10 * time.Millisecond) // Ensure different timestamp
-			err = rq.Update("user:1", map[string]interface{}{"name": "Alice", "age": 31})
-			if err != nil {
-				t.Fatalf("Failed to update data: %v", err)
-			}
+			t.Run("BatchInsert", func(t *testing.T) {
+				testBatchInsert(t, rq)
+			})
 
-			// Test QueryAtTime (updated)
-			data, exists, err = rq.QueryAtTime("user:1", time.Now())
-			if err != nil {
-				t.Fatalf("Failed to query updated data: %v", err)
-			}
-			if !exists {
-				t.Fatal("Updated data should exist")
-			}
-			expectedData = map[string]interface{}{"name": "Alice", "age": 31}
-			if !compareMapsVerbose(t, data, expectedData) {
-				t.Fatalf("Unexpected updated data: got %v, want %v", data, expectedData)
-			}
+			t.Run("TTL", func(t *testing.T) {
+				testTTL(t, rq)
+			})
 
-			// Test QueryAtTime (past)
-			pastTime := initialTime.Add(5 * time.Millisecond)
-			data, exists, err = rq.QueryAtTime("user:1", pastTime)
-			if err != nil {
-				t.Fatalf("Failed to query past data: %v", err)
-			}
-			if !exists {
-				t.Fatalf("Past data should exist. Query time: %v, Initial insert time: %v", pastTime, initialTime)
-			}
-			expectedData = map[string]interface{}{"name": "Alice", "age": 30}
-			if !compareMapsVerbose(t, data, expectedData) {
-				t.Fatalf("Unexpected past data: got %v, want %v", data, expectedData)
-			}
+			t.Run("ConcurrentOperations", func(t *testing.T) {
+				testConcurrentOperations(t, rq)
+			})
 
-			// Test Delete
-			time.Sleep(10 * time.Millisecond) // Ensure different timestamp
-			err = rq.Delete("user:1")
-			if err != nil {
-				t.Fatalf("Failed to delete data: %v", err)
-			}
-
-			// Test QueryAtTime (after deletion)
-			data, exists, err = rq.QueryAtTime("user:1", time.Now())
-			if err != nil {
-				t.Fatalf("Failed to query deleted data: %v", err)
-			}
-			if exists {
-				t.Fatalf("Data should not exist after deletion, but got: %v", data)
-			}
-
-			// Test QueryAtTime (non-existent key)
-			data, exists, err = rq.QueryAtTime("user:2", time.Now())
-			if err != nil {
-				t.Fatalf("Failed to query non-existent data: %v", err)
-			}
-			if exists {
-				t.Fatalf("Data should not exist for non-existent key, but got: %v", data)
-			}
+			t.Run("LargeDataset", func(t *testing.T) {
+				testLargeDataset(t, rq)
+			})
 		})
+	}
+}
+
+func testBasicOperations(t *testing.T, rq *retroquery.RetroQuery) {
+	// Test Insert
+	initialTime := time.Now()
+	err := rq.Insert("user:1", map[string]interface{}{"name": "Alice", "age": 30})
+	if err != nil {
+		t.Fatalf("Failed to insert data: %v", err)
+	}
+
+	// Test QueryAtTime (current)
+	data, exists, err := rq.QueryAtTime("user:1", time.Now())
+	if err != nil || !exists {
+		t.Fatalf("Failed to query data: error=%v, exists=%v", err, exists)
+	}
+	assertEqualMaps(t, data, map[string]interface{}{"name": "Alice", "age": 30})
+
+	// Test Update
+	time.Sleep(10 * time.Millisecond)
+	err = rq.Update("user:1", map[string]interface{}{"name": "Alice", "age": 31})
+	if err != nil {
+		t.Fatalf("Failed to update data: %v", err)
+	}
+
+	// Test QueryAtTime (updated)
+	data, exists, err = rq.QueryAtTime("user:1", time.Now())
+	if err != nil || !exists {
+		t.Fatalf("Failed to query updated data: error=%v, exists=%v", err, exists)
+	}
+	assertEqualMaps(t, data, map[string]interface{}{"name": "Alice", "age": 31})
+
+	// Test QueryAtTime (past)
+	pastTime := initialTime.Add(5 * time.Millisecond)
+	data, exists, err = rq.QueryAtTime("user:1", pastTime)
+	if err != nil || !exists {
+		t.Fatalf("Failed to query past data: error=%v, exists=%v", err, exists)
+	}
+	assertEqualMaps(t, data, map[string]interface{}{"name": "Alice", "age": 30})
+
+	// Test Delete
+	time.Sleep(10 * time.Millisecond)
+	err = rq.Delete("user:1")
+	if err != nil {
+		t.Fatalf("Failed to delete data: %v", err)
+	}
+
+	// Test QueryAtTime (after deletion)
+	data, exists, err = rq.QueryAtTime("user:1", time.Now())
+	if err != nil || exists {
+		t.Fatalf("Data should not exist after deletion: error=%v, exists=%v, data=%v", err, exists, data)
+	}
+
+	// Test QueryAtTime (non-existent key)
+	data, exists, err = rq.QueryAtTime("user:2", time.Now())
+	if err != nil || exists {
+		t.Fatalf("Data should not exist for non-existent key: error=%v, exists=%v, data=%v", err, exists, data)
+	}
+}
+
+func testQueryRange(t *testing.T, rq *retroquery.RetroQuery) {
+	// Insert test data
+	start := time.Now()
+	for i := 0; i < 5; i++ {
+		err := rq.Insert("user:1", map[string]interface{}{"count": i})
+		if err != nil {
+			t.Fatalf("Failed to insert data: %v", err)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	end := time.Now()
+
+	// Query range
+	results, err := rq.QueryRange("user:1", start, end)
+	if err != nil {
+		t.Fatalf("Failed to query range: %v", err)
+	}
+
+	if len(results) != 5 {
+		t.Fatalf("Expected 5 results, got %d", len(results))
+	}
+
+	expectedCounts := []int{4, 3, 2, 1, 0}
+	for i, result := range results {
+		expectedCount := expectedCounts[i]
+		count, ok := result["count"].(int)
+		if !ok {
+			// If it's not an int, let's check if it's a float64 that can be converted to an int
+			if floatCount, isFloat := result["count"].(float64); isFloat {
+				count = int(floatCount)
+				ok = true
+			}
+		}
+
+		if !ok {
+			t.Errorf("Expected count to be an int or a float64 convertible to int, got %T", result["count"])
+		} else if count != expectedCount {
+			t.Errorf("Expected count %d, got %d", expectedCount, count)
+		}
+	}
+}
+
+func testBatchInsert(t *testing.T, rq *retroquery.RetroQuery) {
+	batch := make(map[string]map[string]interface{})
+	for i := 0; i < 100; i++ {
+		batch[fmt.Sprintf("user:%d", i)] = map[string]interface{}{"name": fmt.Sprintf("User%d", i), "age": 20 + i%50}
+	}
+
+	err := rq.BatchInsert(batch)
+	if err != nil {
+		t.Fatalf("Failed to batch insert: %v", err)
+	}
+
+	// Verify inserted data
+	for key, value := range batch {
+		data, exists, err := rq.QueryAtTime(key, time.Now())
+		if err != nil || !exists {
+			t.Fatalf("Failed to query batch inserted data for key %s: error=%v, exists=%v", key, err, exists)
+		}
+		assertEqualMaps(t, data, value)
+	}
+}
+
+func testTTL(t *testing.T, rq *retroquery.RetroQuery) {
+	err := rq.InsertWithTTL("ttl_test", map[string]interface{}{"temp": true}, 100*time.Millisecond)
+	if err != nil {
+		t.Fatalf("Failed to insert data with TTL: %v", err)
+	}
+
+	// Data should exist immediately
+	_, exists, err := rq.QueryAtTime("ttl_test", time.Now())
+	if err != nil || !exists {
+		t.Fatalf("Data with TTL should exist immediately: error=%v, exists=%v", err, exists)
+	}
+
+	// Wait for TTL to expire
+	time.Sleep(200 * time.Millisecond)
+
+	// Data should no longer exist
+	_, exists, err = rq.QueryAtTime("ttl_test", time.Now())
+	if err != nil || exists {
+		t.Fatalf("Data with TTL should no longer exist: error=%v, exists=%v", err, exists)
+	}
+}
+
+func testConcurrentOperations(t *testing.T, rq *retroquery.RetroQuery) {
+	const numOps = 1000
+	errCh := make(chan error, numOps*2)
+
+	for i := 0; i < numOps; i++ {
+		go func(i int) {
+			key := fmt.Sprintf("concurrent:%d", i)
+			errCh <- rq.Insert(key, map[string]interface{}{"value": i})
+			_, _, err := rq.QueryAtTime(key, time.Now())
+			errCh <- err
+		}(i)
+	}
+
+	for i := 0; i < numOps*2; i++ {
+		if err := <-errCh; err != nil {
+			t.Errorf("Concurrent operation failed: %v", err)
+		}
+	}
+}
+
+func testLargeDataset(t *testing.T, rq *retroquery.RetroQuery) {
+	const numRecords = 10000
+	startTime := time.Now()
+
+	for i := 0; i < numRecords; i++ {
+		err := rq.Insert(fmt.Sprintf("large:%d", i), map[string]interface{}{"data": string(make([]byte, 1000))})
+		if err != nil {
+			t.Fatalf("Failed to insert large dataset: %v", err)
+		}
+	}
+
+	endTime := time.Now()
+	t.Logf("Inserted %d records in %v", numRecords, endTime.Sub(startTime))
+
+	// Query a random record
+	key := fmt.Sprintf("large:%d", numRecords/2)
+	_, exists, err := rq.QueryAtTime(key, time.Now())
+	if err != nil || !exists {
+		t.Fatalf("Failed to query large dataset: error=%v, exists=%v", err, exists)
 	}
 }
 
@@ -139,44 +271,42 @@ func TestBackup(t *testing.T) {
 	if _, err := os.Stat(backupPath); os.IsNotExist(err) {
 		t.Fatal("Backup file does not exist")
 	}
+
+	// TODO: Add test for restoring from backup
 }
 
 func getTestName(config retroquery.Config) string {
-	if config.InMemory {
-		return "InMemory"
+	name := "InMemory"
+	if !config.InMemory {
+		name = "DiskBased"
 	}
-	return "DiskBased"
+	if config.Compress {
+		name += "Compressed"
+	}
+	return name
 }
 
-// compareMapsVerbose compares two maps of string to interface{} for equality and logs detailed information
-func compareMapsVerbose(t *testing.T, map1, map2 map[string]interface{}) bool {
-	t.Logf("Comparing maps: %v and %v", map1, map2)
-	if len(map1) != len(map2) {
-		t.Logf("Maps have different lengths: %d vs %d", len(map1), len(map2))
-		return false
+func assertEqualMaps(t *testing.T, got, want map[string]interface{}) {
+	t.Helper()
+	if len(got) != len(want) {
+		t.Fatalf("Map lengths not equal: got %d, want %d", len(got), len(want))
 	}
-	for k, v1 := range map1 {
-		v2, ok := map2[k]
+	for k, wantV := range want {
+		gotV, ok := got[k]
 		if !ok {
-			t.Logf("Key %s not found in second map", k)
-			return false
+			t.Fatalf("Key %q not found in got map", k)
 		}
-		t.Logf("Comparing values for key %s: %v (type %T) vs %v (type %T)", k, v1, v1, v2, v2)
-		if !compareValues(v1, v2) {
-			t.Logf("Values for key %s are not equal: %v vs %v", k, v1, v2)
-			return false
+		if !compareValues(gotV, wantV) {
+			t.Fatalf("Values not equal for key %q: got %v (%T), want %v (%T)", k, gotV, gotV, wantV, wantV)
 		}
 	}
-	return true
 }
 
-// compareValues compares two values, allowing for int-float comparisons
 func compareValues(v1, v2 interface{}) bool {
 	if reflect.TypeOf(v1) == reflect.TypeOf(v2) {
 		return reflect.DeepEqual(v1, v2)
 	}
 
-	// Handle int-float comparisons
 	switch v1.(type) {
 	case int:
 		if v2, ok := v2.(float64); ok {
