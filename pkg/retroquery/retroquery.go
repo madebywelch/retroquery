@@ -1,57 +1,39 @@
 package retroquery
 
 import (
+	"bytes"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
-	"log"
-	"os"
 	"sort"
 	"sync"
 	"time"
 
 	"github.com/dgraph-io/badger/v3"
-	"github.com/klauspost/compress/zstd"
 )
 
 type Record struct {
+	Timestamp int64
 	Data      map[string]interface{}
-	Timestamp time.Time
-	TTL       time.Duration
 }
 
 type RetroQuery struct {
-	data     map[string][]Record
+	data     map[string][]Record // In-memory storage: key -> sorted slice of Records
 	mu       sync.RWMutex
 	db       *badger.DB
 	inMemory bool
-	compress bool
-	encoder  *zstd.Encoder
-	decoder  *zstd.Decoder
 }
 
 type Config struct {
 	InMemory bool
 	DataDir  string
-	Compress bool
 }
 
+// New initializes a new RetroQuery instance.
 func New(config Config) (*RetroQuery, error) {
 	rq := &RetroQuery{
 		data:     make(map[string][]Record),
 		inMemory: config.InMemory,
-		compress: config.Compress,
-	}
-
-	if config.Compress {
-		var err error
-		rq.encoder, err = zstd.NewWriter(nil)
-		if err != nil {
-			return nil, fmt.Errorf("failed to create zstd encoder: %w", err)
-		}
-		rq.decoder, err = zstd.NewReader(nil)
-		if err != nil {
-			return nil, fmt.Errorf("failed to create zstd decoder: %w", err)
-		}
 	}
 
 	if !config.InMemory {
@@ -66,141 +48,129 @@ func New(config Config) (*RetroQuery, error) {
 	return rq, nil
 }
 
+// Close closes the RetroQuery instance.
 func (rq *RetroQuery) Close() error {
 	if rq.db != nil {
 		return rq.db.Close()
 	}
-	if rq.compress {
-		rq.encoder.Close()
-		rq.decoder.Close()
-	}
 	return nil
 }
 
+// Insert inserts a record with the current timestamp.
 func (rq *RetroQuery) Insert(key string, value map[string]interface{}) error {
-	return rq.InsertWithTTL(key, value, 0)
+	return rq.InsertAtTime(key, value, time.Now())
 }
 
-func (rq *RetroQuery) InsertWithTTL(key string, value map[string]interface{}, ttl time.Duration) error {
-	return rq.insert(key, value, time.Now(), ttl)
-}
-
-func (rq *RetroQuery) insert(key string, value map[string]interface{}, timestamp time.Time, ttl time.Duration) error {
+// InsertAtTime inserts a record with a specified timestamp.
+func (rq *RetroQuery) InsertAtTime(key string, value map[string]interface{}, timestamp time.Time) error {
+	ts := timestamp.UnixNano()
 	record := Record{
+		Timestamp: ts,
 		Data:      value,
-		Timestamp: timestamp,
-		TTL:       ttl,
 	}
 
 	if rq.inMemory {
-		rq.mu.Lock()
-		defer rq.mu.Unlock()
-
-		records, ok := rq.data[key]
-		if !ok {
-			records = []Record{}
-		}
-		records = append(records, record)
-		sort.Slice(records, func(i, j int) bool {
-			return records[i].Timestamp.After(records[j].Timestamp)
-		})
-		rq.data[key] = records
-		log.Printf("Inserted record for key: %s, timestamp: %v, records count: %d", key, timestamp, len(records))
+		rq.insertInMemory(key, record)
 		return nil
 	}
 
+	return rq.insertOnDisk(key, record)
+}
+
+// insertInMemory inserts a record into the in-memory storage.
+func (rq *RetroQuery) insertInMemory(key string, record Record) {
+	rq.mu.Lock()
+	defer rq.mu.Unlock()
+
+	records := rq.data[key]
+	// Find the insertion point using binary search
+	idx := sort.Search(len(records), func(i int) bool {
+		return records[i].Timestamp >= record.Timestamp
+	})
+	if idx < len(records) && records[idx].Timestamp == record.Timestamp {
+		records[idx] = record
+	} else {
+		records = append(records, Record{})
+		copy(records[idx+1:], records[idx:])
+		records[idx] = record
+	}
+	rq.data[key] = records
+}
+
+// insertOnDisk inserts a record into the BadgerDB.
+func (rq *RetroQuery) insertOnDisk(key string, record Record) error {
+	keyBytes := encodeKey(key, record.Timestamp)
+	recordBytes, err := json.Marshal(record.Data)
+	if err != nil {
+		return err
+	}
+
 	return rq.db.Update(func(txn *badger.Txn) error {
-		recordBytes, err := json.Marshal(record)
-		if err != nil {
-			return err
-		}
-
-		if rq.compress {
-			recordBytes = rq.encoder.EncodeAll(recordBytes, nil)
-		}
-
-		entry := badger.NewEntry([]byte(fmt.Sprintf("%s_%s", key, record.Timestamp.Format(time.RFC3339Nano))), recordBytes)
-		if ttl > 0 {
-			entry = entry.WithTTL(ttl)
-		}
-		return txn.SetEntry(entry)
+		return txn.Set(keyBytes, recordBytes)
 	})
 }
 
-func (rq *RetroQuery) Update(key string, value map[string]interface{}) error {
-	return rq.Insert(key, value)
+// encodeKey encodes the key and timestamp into a byte slice.
+func encodeKey(key string, timestamp int64) []byte {
+	buf := make([]byte, len(key)+8)
+	copy(buf, key)
+	binary.BigEndian.PutUint64(buf[len(key):], uint64(timestamp))
+	return buf
 }
 
-func (rq *RetroQuery) Delete(key string) error {
-	return rq.Insert(key, map[string]interface{}{"_deleted": true})
-}
-
+// QueryAtTime queries the record at a specific timestamp.
 func (rq *RetroQuery) QueryAtTime(key string, timestamp time.Time) (map[string]interface{}, bool, error) {
-	log.Printf("QueryAtTime called with key: %s, timestamp: %v", key, timestamp)
+	ts := timestamp.UnixNano()
 
 	if rq.inMemory {
-		rq.mu.RLock()
-		defer rq.mu.RUnlock()
-
-		records, exists := rq.data[key]
-		if !exists {
-			log.Printf("No records found for key: %s", key)
-			return nil, false, nil
-		}
-
-		log.Printf("Found records for key: %s, count: %d", key, len(records))
-
-		for _, record := range records {
-			log.Printf("Examining record with timestamp: %v", record.Timestamp)
-			if record.Timestamp.After(timestamp) {
-				continue
-			}
-			if record.TTL > 0 && time.Since(record.Timestamp) > record.TTL {
-				continue // Skip expired records
-			}
-			if _, deleted := record.Data["_deleted"]; deleted {
-				log.Printf("Found deleted record")
-				return nil, false, nil
-			}
-			log.Printf("Found matching record: %v", record.Data)
-			return record.Data, true, nil
-		}
-
-		log.Printf("No matching records found")
-		return nil, false, nil
+		return rq.queryInMemory(key, ts)
 	}
 
-	var result Record
-	var found bool
+	return rq.queryOnDisk(key, ts)
+}
+
+// queryInMemory queries the in-memory storage for a record at a specific timestamp.
+func (rq *RetroQuery) queryInMemory(key string, ts int64) (map[string]interface{}, bool, error) {
+	rq.mu.RLock()
+	defer rq.mu.RUnlock()
+
+	records := rq.data[key]
+	idx := sort.Search(len(records), func(i int) bool {
+		return records[i].Timestamp > ts
+	})
+	if idx == 0 {
+		return nil, false, nil
+	}
+	record := records[idx-1]
+	if record.Data == nil {
+		return nil, false, nil
+	}
+	return record.Data, true, nil
+}
+
+// queryOnDisk queries the BadgerDB for a record at a specific timestamp.
+func (rq *RetroQuery) queryOnDisk(key string, ts int64) (map[string]interface{}, bool, error) {
+	prefix := []byte(key)
+	seekKey := encodeKey(key, ts)
+	var data map[string]interface{}
+
 	err := rq.db.View(func(txn *badger.Txn) error {
 		opts := badger.DefaultIteratorOptions
 		opts.Reverse = true
 		it := txn.NewIterator(opts)
 		defer it.Close()
 
-		prefix := []byte(key + "_")
-		for it.Seek(append(prefix, []byte(timestamp.Format(time.RFC3339Nano))...)); it.ValidForPrefix(prefix); it.Next() {
+		for it.Seek(seekKey); it.Valid(); it.Next() {
 			item := it.Item()
-			if item.IsDeletedOrExpired() {
-				continue
+			k := item.Key()
+			if !bytes.HasPrefix(k, prefix) {
+				break
 			}
-			err := item.Value(func(v []byte) error {
-				if rq.compress {
-					decoded, err := rq.decoder.DecodeAll(v, nil)
-					if err != nil {
-						return err
-					}
-					v = decoded
-				}
-				return json.Unmarshal(v, &result)
-			})
-			if err != nil {
+			if err := item.Value(func(val []byte) error {
+				return json.Unmarshal(val, &data)
+			}); err != nil {
 				return err
 			}
-			if result.Timestamp.After(timestamp) {
-				continue
-			}
-			found = true
 			return nil
 		}
 		return nil
@@ -209,117 +179,82 @@ func (rq *RetroQuery) QueryAtTime(key string, timestamp time.Time) (map[string]i
 	if err != nil {
 		return nil, false, err
 	}
-	if !found || result.Data == nil {
+	if data == nil {
 		return nil, false, nil
 	}
-	if _, deleted := result.Data["_deleted"]; deleted {
-		return nil, false, nil
-	}
-	return result.Data, true, nil
+	return data, true, nil
 }
 
-func (rq *RetroQuery) BatchInsert(records map[string]map[string]interface{}) error {
-	timestamp := time.Now()
-	if rq.inMemory {
-		for key, value := range records {
-			if err := rq.insert(key, value, timestamp, 0); err != nil {
-				return err
-			}
-		}
-		return nil
-	}
-
-	return rq.db.Update(func(txn *badger.Txn) error {
-		for key, value := range records {
-			record := Record{
-				Data:      value,
-				Timestamp: timestamp,
-			}
-			recordBytes, err := json.Marshal(record)
-			if err != nil {
-				return err
-			}
-
-			if rq.compress {
-				recordBytes = rq.encoder.EncodeAll(recordBytes, nil)
-			}
-
-			if err := txn.Set([]byte(fmt.Sprintf("%s_%s", key, record.Timestamp.Format(time.RFC3339Nano))), recordBytes); err != nil {
-				return err
-			}
-		}
-		return nil
-	})
+// Delete marks a key as deleted at the current timestamp.
+func (rq *RetroQuery) Delete(key string) error {
+	return rq.Insert(key, nil)
 }
 
+// QueryRange queries records within a specific time range.
 func (rq *RetroQuery) QueryRange(key string, start, end time.Time) ([]map[string]interface{}, error) {
-	log.Printf("QueryRange called with key: %s, start: %v, end: %v", key, start, end)
+	if rq.inMemory {
+		return rq.queryRangeInMemory(key, start.UnixNano(), end.UnixNano())
+	}
+
+	return rq.queryRangeOnDisk(key, start.UnixNano(), end.UnixNano())
+}
+
+// queryRangeInMemory queries the in-memory storage for records within a time range.
+func (rq *RetroQuery) queryRangeInMemory(key string, startTs, endTs int64) ([]map[string]interface{}, error) {
+	rq.mu.RLock()
+	defer rq.mu.RUnlock()
+
+	records := rq.data[key]
+	var results []map[string]interface{}
+
+	idxStart := sort.Search(len(records), func(i int) bool {
+		return records[i].Timestamp >= startTs
+	})
+
+	idxEnd := sort.Search(len(records), func(i int) bool {
+		return records[i].Timestamp > endTs
+	})
+
+	for i := idxStart; i < idxEnd; i++ {
+		record := records[i]
+		if record.Data != nil {
+			results = append(results, record.Data)
+		}
+	}
+
+	return results, nil
+}
+
+// queryRangeOnDisk queries the BadgerDB for records within a time range.
+func (rq *RetroQuery) queryRangeOnDisk(key string, startTs, endTs int64) ([]map[string]interface{}, error) {
+	prefix := []byte(key)
+	startKey := encodeKey(key, startTs)
+	endKey := encodeKey(key, endTs)
 
 	var results []map[string]interface{}
 
-	if rq.inMemory {
-		rq.mu.RLock()
-		defer rq.mu.RUnlock()
-
-		records, exists := rq.data[key]
-		if !exists {
-			log.Printf("No records found for key: %s", key)
-			return results, nil
-		}
-
-		for _, record := range records {
-			if record.Timestamp.Before(start) {
-				continue
-			}
-			if record.Timestamp.After(end) {
-				break
-			}
-			if _, deleted := record.Data["_deleted"]; !deleted {
-				results = append([]map[string]interface{}{record.Data}, results...)
-			}
-		}
-
-		for i := 0; i < len(results)/2; i++ {
-			j := len(results) - 1 - i
-			results[i], results[j] = results[j], results[i]
-		}
-
-		return results, nil
-	}
-
 	err := rq.db.View(func(txn *badger.Txn) error {
 		opts := badger.DefaultIteratorOptions
-		opts.Reverse = true
 		it := txn.NewIterator(opts)
 		defer it.Close()
 
-		prefix := []byte(key + "_")
-		for it.Seek(append(prefix, []byte(end.Format(time.RFC3339Nano))...)); it.ValidForPrefix(prefix); it.Next() {
+		for it.Seek(startKey); it.Valid(); it.Next() {
 			item := it.Item()
-			var record Record
-			err := item.Value(func(v []byte) error {
-				if rq.compress {
-					decoded, err := rq.decoder.DecodeAll(v, nil)
-					if err != nil {
-						return err
-					}
-					v = decoded
-				}
-				return json.Unmarshal(v, &record)
-			})
-			if err != nil {
-				return err
-			}
-
-			if record.Timestamp.Before(start) {
+			k := item.Key()
+			if bytes.Compare(k, endKey) > 0 {
 				break
 			}
-			if record.Timestamp.After(end) {
-				continue
+			if !bytes.HasPrefix(k, prefix) {
+				break
 			}
-
-			if _, deleted := record.Data["_deleted"]; !deleted {
-				results = append(results, record.Data)
+			var data map[string]interface{}
+			if err := item.Value(func(val []byte) error {
+				return json.Unmarshal(val, &data)
+			}); err != nil {
+				return err
+			}
+			if data != nil {
+				results = append(results, data)
 			}
 		}
 		return nil
@@ -332,29 +267,29 @@ func (rq *RetroQuery) QueryRange(key string, start, end time.Time) ([]map[string
 	return results, nil
 }
 
-func (rq *RetroQuery) Compact() error {
+// BatchInsert inserts multiple records at the current timestamp.
+func (rq *RetroQuery) BatchInsert(records map[string]map[string]interface{}) error {
+	timestamp := time.Now()
 	if rq.inMemory {
-		return fmt.Errorf("compact operation not supported for in-memory storage")
+		for key, value := range records {
+			if err := rq.InsertAtTime(key, value, timestamp); err != nil {
+				return err
+			}
+		}
+		return nil
 	}
 
-	return rq.db.RunValueLogGC(0.5)
-}
-
-func (rq *RetroQuery) Backup(dst string) error {
-	if rq.inMemory {
-		return fmt.Errorf("backup not supported for in-memory database")
-	}
-
-	f, err := os.Create(dst)
-	if err != nil {
-		return fmt.Errorf("failed to create backup file: %w", err)
-	}
-	defer f.Close()
-
-	_, err = rq.db.Backup(f, 0)
-	if err != nil {
-		return fmt.Errorf("failed to backup database: %w", err)
-	}
-
-	return nil
+	return rq.db.Update(func(txn *badger.Txn) error {
+		for key, value := range records {
+			recordBytes, err := json.Marshal(value)
+			if err != nil {
+				return err
+			}
+			keyBytes := encodeKey(key, timestamp.UnixNano())
+			if err := txn.Set(keyBytes, recordBytes); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
 }

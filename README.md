@@ -95,26 +95,4 @@ func main() {
 }
 ```
 
-## Performance
-
-RetroQuery has been benchmarked for performance in both in-memory and disk-based configurations. Here are some recent benchmark results:
-
-```
-BenchmarkConcurrentInsertAndQueryRPS/Config=false-8    1    10050352416 ns/op    26142 rps
-```
-
-This benchmark was run on a machine with the following specifications:
-
-- CPU: 8 cores
-- Memory: 16 GB
-- Storage: SSD
-
-The benchmark simulates a mixed workload of 20% inserts and 80% queries, running concurrently across all available CPU cores. The disk-based configuration achieved approximately 26,142 requests per second.
-
-## Contributing
-
-Contributions to RetroQuery are welcome! Please feel free to submit a Pull Request.
-
-## License
-
 RetroQuery is released under the MIT License. See the LICENSE file for details.
